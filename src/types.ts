@@ -1,5 +1,5 @@
 export type RaceStatus = 'scheduled' | 'running' | 'finished';
-export type ProtestStatus = 'submitted' | 'reviewing' | 'resolved' | 'rejected';
+export type ProtestStatus = 'pending' | 'submitted' | 'reviewing' | 'resolved' | 'rejected';
 export type ResultStatus = 'provisional' | 'corrected' | 'official';
 
 export interface Race {
@@ -8,6 +8,8 @@ export interface Race {
   fleet: string;
   course: string;
   startsAt: string;
+  /** 收船时刻，竞赛官可回填和更正；抗议截止点为其后 60 分钟 */
+  boatInAt?: string;
   status: RaceStatus;
 }
 
@@ -30,6 +32,13 @@ export interface Protest {
   rule: string;
   status: ProtestStatus;
   decision: string;
+  /** 迟交理由：收船 60 分钟后送达的抗议，仲裁补写理由并确认后才能进复核 */
+  lateReason: string;
+  /** 接受抗议时实际加到成绩上的处罚秒数，用于截止点重算时撤销 */
+  appliedPenalty: number;
+  /** 撤销处罚时恢复的成绩快照 */
+  penaltyBefore?: number;
+  resultStatusBefore?: ResultStatus;
   createdAt: string;
 }
 

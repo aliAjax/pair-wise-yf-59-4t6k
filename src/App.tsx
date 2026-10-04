@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { App as AntApp, Badge, Button, Card, Col, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Select, Space, Statistic, Table, Tag, Timeline, Typography, message } from 'antd';
+import { App as AntApp, Badge, Button, Card, Col, DatePicker, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Select, Space, Statistic, Table, Tabs, Tag, Timeline, Typography, message } from 'antd';
 import { ClockCircleOutlined, FlagOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
@@ -7,9 +7,10 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
-import { addProtest, saveResult, setRaceStatus, transitionProtest, type AppDispatch, type RootState } from './store';
+import dayjs from 'dayjs';
+import { addProtest, confirmLateProtest, saveResult, setBoatInAt, setRaceStatus, transitionProtest, protestDeadline, type AppDispatch, type RootState } from './store';
 import { useGetOfficialsQuery } from './api';
-import type { RaceEntry } from './types';
+import type { Protest, RaceEntry } from './types';
 
 const { Header, Content, Sider } = Layout;
 
@@ -50,7 +51,18 @@ function ControlPage() {
               <Descriptions.Item label="组别">{race.fleet}</Descriptions.Item>
               <Descriptions.Item label="航线">{race.course}</Descriptions.Item>
             </Descriptions>
-            <Space wrap>
+            <Space wrap style={{ marginTop: 12 }}>
+              <span>收船时刻：</span>
+              <DatePicker
+                showTime
+                format="YYYY-MM-DD HH:mm"
+                placeholder="竞赛官回填收船时刻"
+                value={race.boatInAt ? dayjs(race.boatInAt) : null}
+                onChange={(value) => { if (value) dispatch(setBoatInAt({ id: race.id, boatInAt: value.toISOString() })); }}
+              />
+              {race.boatInAt && <Tag color="blue">抗议截止 {dayjs(race.boatInAt).add(60, 'minute').format('MM-DD HH:mm')}</Tag>}
+            </Space>
+            <Space wrap style={{ marginTop: 12 }}>
               <Button type="primary" icon={<FlagOutlined />} onClick={() => dispatch(setRaceStatus({ id: race.id, status: 'running' }))}>开始比赛</Button>
               <Button onClick={() => dispatch(setRaceStatus({ id: race.id, status: 'finished' }))}>结束比赛</Button>
               <Button onClick={() => dispatch(setRaceStatus({ id: race.id, status: 'scheduled' }))}>重置排队</Button>
@@ -121,49 +133,102 @@ function ResultsPage() {
   );
 }
 
+function lateMinutes(deadline: Date, createdAt: string) {
+  return Math.max(0, Math.round((new Date(createdAt).getTime() - deadline.getTime()) / 60000));
+}
+
+function PendingItem({ protest, boatName, deadline }: { protest: Protest; boatName: string; deadline: Date | null }) {
+  const dispatch = useDispatch<AppDispatch>();
+  const [reason, setReason] = useState('');
+  return (
+    <List.Item>
+      <List.Item.Meta
+        title={<Space wrap><Tag color="warning">待定</Tag><Tag>{protest.rule}</Tag>{deadline && <Tag color="red">逾期 {lateMinutes(deadline, protest.createdAt)} 分钟</Tag>}</Space>}
+        description={<><div>{protest.reason}</div><small>{boatName} · 送达 {new Date(protest.createdAt).toLocaleString()}</small></>}
+      />
+      <Space direction="vertical" style={{ width: 280 }}>
+        <Input.TextArea rows={2} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="仲裁补写迟交理由，如：收船后靠岸延误，迟交因现场避让" />
+        <Button type="primary" disabled={!reason.trim()} onClick={() => dispatch(confirmLateProtest({ id: protest.id, lateReason: reason.trim() }))}>确认理由并转入复核</Button>
+      </Space>
+    </List.Item>
+  );
+}
+
+function QueueItem({ protest, boatName, deadline }: { protest: Protest; boatName: string; deadline: Date | null }) {
+  const dispatch = useDispatch<AppDispatch>();
+  const late = deadline ? new Date(protest.createdAt).getTime() > deadline.getTime() : false;
+  return (
+    <List.Item>
+      <List.Item.Meta
+        title={<Space wrap><Tag color={protest.status === 'reviewing' ? 'processing' : protest.status === 'resolved' ? 'green' : protest.status === 'rejected' ? 'red' : 'default'}>{protest.status}</Tag><Tag>{protest.rule}</Tag>{late ? <Tag color="red">逾期已受理</Tag> : <Tag color="green">准时</Tag>}</Space>}
+        description={
+          <>
+            <div>{protest.reason}</div>
+            {protest.decision && <div>判定：{protest.decision}</div>}
+            {protest.lateReason && <div>迟交理由：{protest.lateReason}</div>}
+            <small>{boatName} · 送达 {new Date(protest.createdAt).toLocaleString()}</small>
+          </>
+        }
+      />
+      <Space direction="vertical">
+        {protest.status === 'submitted' && <Button size="small" onClick={() => dispatch(transitionProtest({ id: protest.id, status: 'reviewing' }))}>进入复核</Button>}
+        {protest.status !== 'resolved' && protest.status !== 'rejected' && <>
+          <Button size="small" type="primary" onClick={() => dispatch(transitionProtest({ id: protest.id, status: 'resolved', decision: '接受抗议并处以30秒处罚', penaltySeconds: 30 }))}>接受并处罚</Button>
+          <Button size="small" danger onClick={() => dispatch(transitionProtest({ id: protest.id, status: 'rejected', decision: '证据不足，维持原成绩' }))}>驳回</Button>
+        </>}
+      </Space>
+    </List.Item>
+  );
+}
+
 function ProtestsPage() {
   const dispatch = useDispatch<AppDispatch>();
   const protests = useSelector((state: RootState) => state.regatta.protests);
   const timeline = useSelector((state: RootState) => state.regatta.timeline);
   const entries = useSelector((state: RootState) => state.regatta.entries);
+  const race = useSelector((state: RootState) => state.regatta.races[0]);
   const { register, handleSubmit, reset, formState: { errors } } = useForm<z.infer<typeof protestSchema>>({ resolver: zodResolver(protestSchema), defaultValues: { entryId: entries[0]?.id, reason: '', rule: 'RRS 14' } });
+  const deadline = race ? protestDeadline(race) : null;
+  const pending = protests.filter((item) => item.status === 'pending');
+  const queued = protests.filter((item) => item.status !== 'pending');
+  const boatName = (entryId: string) => entries.find((entry) => entry.id === entryId)?.boat ?? '未知船只';
   const submit = (values: z.infer<typeof protestSchema>) => {
     dispatch(addProtest({ raceId: 'race-1', ...values }));
     reset({ entryId: entries[0]?.id, reason: '', rule: 'RRS 14' });
   };
   return (
     <Row gutter={[18, 18]}>
-      <Col xs={24} lg={9}>
-        <Card title="提交抗议">
-          <Form layout="vertical" onFinish={handleSubmit(submit)}>
-            <Form.Item label="参赛船" validateStatus={errors.entryId ? 'error' : undefined}>
-              <select className="native-select" {...register('entryId')}>{entries.map((entry) => <option key={entry.id} value={entry.id}>{entry.boat}</option>)}</select>
-            </Form.Item>
-            <Form.Item label="适用规则" validateStatus={errors.rule ? 'error' : undefined} help={errors.rule?.message}><Input {...register('rule')} /></Form.Item>
-            <Form.Item label="事件描述" validateStatus={errors.reason ? 'error' : undefined} help={errors.reason?.message}><Input.TextArea rows={4} {...register('reason')} /></Form.Item>
-            <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>登记抗议</Button>
-          </Form>
-        </Card>
+      <Col xs={24} lg={8}>
+        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+          <Card title="提交抗议">
+            <Form layout="vertical" onFinish={handleSubmit(submit)}>
+              <Form.Item label="参赛船" validateStatus={errors.entryId ? 'error' : undefined}>
+                <select className="native-select" {...register('entryId')}>{entries.map((entry) => <option key={entry.id} value={entry.id}>{entry.boat}</option>)}</select>
+              </Form.Item>
+              <Form.Item label="适用规则" validateStatus={errors.rule ? 'error' : undefined} help={errors.rule?.message}><Input {...register('rule')} /></Form.Item>
+              <Form.Item label="事件描述" validateStatus={errors.reason ? 'error' : undefined} help={errors.reason?.message}><Input.TextArea rows={4} {...register('reason')} /></Form.Item>
+              <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>登记抗议</Button>
+            </Form>
+          </Card>
+          <Card title="抗议截止点">
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="收船时刻">{race?.boatInAt ? dayjs(race.boatInAt).format('YYYY-MM-DD HH:mm') : '未设置（竞赛官在竞赛控制页回填）'}</Descriptions.Item>
+              <Descriptions.Item label="截止时刻">{deadline ? dayjs(deadline).format('YYYY-MM-DD HH:mm') : '收船后 60 分钟，尚未生效'}</Descriptions.Item>
+              <Descriptions.Item label="准入规则">收船 60 分钟内送达直接进复核；逾期先进待定区，仲裁补写迟交理由并确认后才进复核</Descriptions.Item>
+            </Descriptions>
+          </Card>
+        </Space>
       </Col>
-      <Col xs={24} lg={9}>
-        <Card title="冲突复核队列">
-          {protests.length === 0 ? <Empty /> : <List dataSource={protests} renderItem={(item) => (
-            <List.Item>
-              <List.Item.Meta
-                title={<Space><Tag color={item.status === 'reviewing' ? 'processing' : 'default'}>{item.status}</Tag>{item.rule}</Space>}
-                description={<><div>{item.reason}</div><small>{entries.find((entry) => entry.id === item.entryId)?.boat}</small></>}
-              />
-              <Space direction="vertical">
-                <Button size="small" onClick={() => dispatch(transitionProtest({ id: item.id, status: 'reviewing' }))}>进入复核</Button>
-                <Button size="small" type="primary" onClick={() => dispatch(transitionProtest({ id: item.id, status: 'resolved', decision: '接受抗议并处以30秒处罚', penaltySeconds: 30 }))}>接受并处罚</Button>
-                <Button size="small" danger onClick={() => dispatch(transitionProtest({ id: item.id, status: 'rejected', decision: '证据不足，维持原成绩' }))}>驳回</Button>
-              </Space>
-            </List.Item>
-          )} />}
+      <Col xs={24} lg={10}>
+        <Card title="抗议队列">
+          <Tabs items={[
+            { key: 'pending', label: <span>待定区 {pending.length > 0 && <Tag color="warning">{pending.length}</Tag>}</span>, children: pending.length === 0 ? <Empty description="无逾期待定抗议" /> : <List dataSource={pending} renderItem={(item) => <PendingItem protest={item} boatName={boatName(item.entryId)} deadline={deadline} />} /> },
+            { key: 'queue', label: <span>复核队列 {queued.length > 0 && <Tag color="blue">{queued.length}</Tag>}</span>, children: queued.length === 0 ? <Empty /> : <List dataSource={queued} renderItem={(item) => <QueueItem protest={item} boatName={boatName(item.entryId)} deadline={deadline} />} /> }
+          ]} />
         </Card>
       </Col>
       <Col xs={24} lg={6}>
-        <Card title="事件时间线"><Timeline items={timeline.map((event) => ({ color: event.type === 'protest' ? 'orange' : 'blue', children: <><b>{event.type}</b><div>{event.message}</div><small>{new Date(event.time).toLocaleTimeString()}</small></> }))} /></Card>
+        <Card title="事件时间线"><Timeline items={timeline.map((event) => ({ color: event.type === 'protest' ? 'orange' : event.type === 'result' ? 'green' : event.type === 'system' ? 'red' : 'blue', children: <><b>{event.type}</b><div>{event.message}</div><small>{new Date(event.time).toLocaleString()}</small></> }))} /></Card>
       </Col>
     </Row>
   );
